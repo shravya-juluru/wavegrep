@@ -1,0 +1,20 @@
+# Built FSDB backend (compile locally against your Verdi install)
+/fsdb_query
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+
+# Hierarchy-index cache (if a run ever writes it inside the repo)
+wfm_cache*/
+*.partial
+
+# Editor / OS cruft
+.DS_Store
+*.swp
