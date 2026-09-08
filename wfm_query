@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Shravya Juluru
+"""
+wfm_query - waveform query frontend; dispatches on waveform format.
+
+  *.fsdb              -> fsdb_query  (Synopsys FSDB, native FsdbReader)
+  *.shm / *.trn       -> shm_query   (Cadence SimVision SST2)
+  *.vcd / *.vcd.gz    -> vcd_query   (IEEE 1364 VCD; Verilator/Icarus/GHDL/...)
+
+All backends share the same command surface, the same "all times are in
+nanoseconds" contract, and the same `Resolved: <path>` stderr convention, so
+callers do not need to care which one ran (see CONTRACT.md). On POSIX the
+backend is reached with os.execv, so stdout/stderr and the exit code pass
+through untouched.
+"""
+
+import os
+import sys
+
+# Bump the major on any breaking change to the output contract (see CONTRACT.md).
+CONTRACT_VERSION = "1.0"
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+FSDB_BACKEND = os.path.join(HERE, "fsdb_query")
+SHM_BACKEND = os.path.join(HERE, "shm_query")
+VCD_BACKEND = os.path.join(HERE, "vcd_query")
+
+USAGE = """usage: wfm_query <waveform> <command> [args]
+
+  <waveform>  a .fsdb file, a .shm directory / .trn file, or a .vcd[.gz] file
+
+  info
+  scopes <keyword>
+  signals [pattern] [-n max]
+  value <signal> <time_ns>
+  changes <signal> [t0_ns] [t1_ns] [-n max]
+  freq <block>
+  debug <block> <time_ns> [-w window_ns]
+  batch [file]
+
+All times are in nanoseconds.
+"""
+
+
+def die(msg):
+    sys.stderr.write("wfm_query: %s\n" % msg)
+    sys.exit(1)
+
+
+def pick_backend(path):
+    """Choose by extension, then fall back to sniffing the file/directory."""
+    real = os.path.realpath(os.path.expanduser(path))
+    low = real.lower()
+
+    if low.endswith(".fsdb"):
+        return FSDB_BACKEND
+    if low.endswith(".shm") or low.endswith(".trn"):
+        return SHM_BACKEND
+    if low.endswith(".vcd") or low.endswith(".vcd.gz"):
+        return VCD_BACKEND
+
+    if not os.path.exists(real):
+        die("no such waveform: %s" % path)
+
+    # Unrecognised name: sniff rather than guess.
+    if os.path.isdir(real):
+        names = os.listdir(real)
+        if any(n.endswith(".trn") for n in names):
+            return SHM_BACKEND
+        die("directory is not an SST2 database (no .trn inside): %s" % path)
+
+    with open(real, "rb") as fh:
+        magic = fh.read(64)
+    if magic[:1] == b"\x00" or b"fsdb" in magic.lower():
+        return FSDB_BACKEND
+    if magic.lstrip()[:1] == b"$" or magic[:2] == b"\x1f\x8b":   # VCD keyword, or gzip
+        return VCD_BACKEND
+    die("cannot determine waveform format of %s\n"
+        "  Expected a .fsdb file, a .shm directory / .trn file, or a .vcd[.gz] file." % path)
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "-V"):
+        sys.stdout.write("wfm_query %s\n" % CONTRACT_VERSION)
+        sys.exit(0)
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stderr.write(USAGE)
+        sys.exit(0 if argv else 2)
+    if len(argv) < 2:
+        sys.stderr.write(USAGE)
+        sys.exit(2)
+
+    backend = pick_backend(argv[0])
+    if not os.path.isfile(backend):
+        die("backend not found: %s" % backend)
+
+    # fsdb_query is a compiled binary; shm_query / vcd_query are Python scripts
+    # and are always runnable through this interpreter, +x or not.
+    if backend == FSDB_BACKEND:
+        if not os.access(backend, os.X_OK):
+            die("backend is not executable: %s" % backend)
+        cmd = [backend] + argv
+    else:
+        cmd = [sys.executable, backend] + argv
+
+    if os.name == "posix":
+        try:
+            os.execv(cmd[0], cmd)          # transparent: stdio + exit passthrough
+        except OSError as e:
+            die("failed to exec %s: %s" % (cmd[0], e))
+    else:
+        import subprocess
+        sys.exit(subprocess.call(cmd))
+
+
+if __name__ == "__main__":
+    main()

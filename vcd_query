@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Shravya Juluru
+"""
+vcd_query - query IEEE 1364 VCD (Value Change Dump) waveforms.
+
+Third backend behind wfm_query, alongside fsdb_query (Synopsys FSDB) and
+shm_query (Cadence SST2). Same command surface, the same "all times are in
+nanoseconds" contract, the same `Resolved: <path>` stderr convention, and the
+same output formatting (see CONTRACT.md) so callers never have to care which
+backend ran.
+
+VCD is the open, vendor-neutral format emitted by Verilator (--trace), Icarus
+Verilog ($dumpfile/$dumpvars), GHDL, nvc, cocotb, and EDA Playground. Pure
+Python, standard library only, no build step. `.vcd` and gzip'd `.vcd.gz` are
+both accepted.
+
+Scaffold status: parses the whole file into memory on each invocation (no
+persistent index yet - fine for typical sim dumps and fixtures, revisit for
+multi-GB VCDs). Real-valued (`r`) signals are reported as recorded;
+the hex column is not meaningful for them.
+"""
+
+import gzip
+import os
+import re
+import sys
+
+# ---- knobs (shared vocabulary with the other backends) --------------------
+SIGNALS_DEFAULT_MAX = int(os.environ.get("WFM_SIGNALS_MAX", "100"))
+CHANGES_DEFAULT_CAP = int(os.environ.get("WFM_CHANGES_MAX", "1000"))
+DEBUG_SIGNAL_CAP = int(os.environ.get("WFM_DEBUG_CAP", "40"))
+DEBUG_TRANS_CAP = int(os.environ.get("WFM_DEBUG_TRANS_CAP", "20"))
+FREQ_EDGES = int(os.environ.get("WFM_FREQ_EDGES", "3"))
+VALUE_EPS_NS = float(os.environ.get("WFM_VALUE_EPS_NS", "1.0"))
+
+_DEBUG_KEYWORDS = tuple(
+    (os.environ.get("WFM_DEBUG_KEYWORDS") or
+     "clk,valid,ready,rdy,enable,_en,data,err,req,ack,grant,done,busy,stall").split(",")
+)
+
+_UNIT_TO_NS = {"fs": 1e-6, "ps": 1e-3, "ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+
+
+def die(msg, code=1):
+    sys.stderr.write("vcd_query: %s\n" % msg)
+    sys.exit(code)
+
+
+# ---- Formatting: byte-identical to fsdb_query / shm_query -----------------
+
+def format_time_ns(ns):
+    """Decimal nanoseconds: 3 places at or above 1 ns, 6 places below."""
+    ns = float(ns)
+    return "%.3f" % ns if abs(ns) >= 1.0 else "%.6f" % ns
+
+
+def bin_to_hex(bits):
+    """Nibble-wise binary -> hex, propagating x/z exactly as fsdb_query does."""
+    if not bits or not all(c in "01xXzZ" for c in bits):
+        return bits
+    padded = bits.lower()
+    if len(padded) % 4:
+        padded = "0" * (4 - len(padded) % 4) + padded
+    out = []
+    for i in range(0, len(padded), 4):
+        nib = padded[i:i + 4]
+        if "x" in nib:
+            out.append("x")
+        elif "z" in nib:
+            out.append("z")
+        else:
+            out.append("%x" % int(nib, 2))
+    return "".join(out)
+
+
+def is_debug_signal_name(name_lower):
+    """Mirror of is_debug_signal_name() in fsdb_query.cpp / shm_query."""
+    for kw in _DEBUG_KEYWORDS:
+        if kw and kw in name_lower:
+            return True
+    return name_lower.startswith("en")
+
+
+# ---- VCD parsing ---------------------------------------------------------
+
+class Vcd:
+    def __init__(self):
+        self.timescale_ns = 1.0
+        self.date = ""
+        self.version = ""
+        self.paths = []                 # ordered unique full paths (dot-separated)
+        self.meta = {}                  # path -> {"type": str, "width": int}
+        self.path_to_id = {}            # path -> id code
+        self.changes = {}              # id code -> [(tick, value_str), ...] deduped
+        self.scopes = []               # ordered unique scope paths
+        self.first_tick = None
+        self.last_tick = 0
+
+    # -- time helpers (ticks are integers in timescale units) --
+    def tick_to_ns(self, tick):
+        return tick * self.timescale_ns
+
+    def ns_to_tick(self, ns):
+        return float(ns) / self.timescale_ns
+
+    @property
+    def t0_ns(self):
+        return self.tick_to_ns(self.first_tick or 0)
+
+    @property
+    def t1_ns(self):
+        return self.tick_to_ns(self.last_tick)
+
+
+def _open(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", errors="replace")
+    return open(path, "r", errors="replace")
+
+
+_TS_RE = re.compile(r"([0-9.]+)\s*([a-z]*)")
+
+
+def _extend(value, width):
+    """IEEE 1364 left-extension of a vector value to its declared width."""
+    if not value:
+        return value
+    if len(value) >= width:
+        return value[-width:]
+    pad = value[0]
+    if pad not in "xzXZ":
+        pad = "0"
+    return pad.lower() * (width - len(value)) + value
+
+
+def parse_vcd(path):
+    v = Vcd()
+    scope_stack = []
+    id_last = {}                        # id code -> last value seen (for dedupe)
+
+    with _open(path) as fh:
+        # ---------- header ----------
+        buf = []
+        in_defs = True
+        cur_tick = 0
+        for line in fh:
+            s = line.strip()
+            if not s:
+                continue
+
+            if in_defs:
+                buf.extend(s.split())
+                while buf:
+                    tok = buf[0]
+                    if tok == "$timescale":
+                        end = buf.index("$end") if "$end" in buf else None
+                        if end is None:
+                            break
+                        body = " ".join(buf[1:end])
+                        m = _TS_RE.search(body)
+                        if m:
+                            num = float(m.group(1))
+                            v.timescale_ns = num * _UNIT_TO_NS.get(m.group(2) or "ns", 1.0)
+                        del buf[:end + 1]
+                    elif tok in ("$date", "$version", "$comment"):
+                        if "$end" not in buf:
+                            break
+                        end = buf.index("$end")
+                        text = " ".join(buf[1:end])
+                        if tok == "$date":
+                            v.date = text
+                        elif tok == "$version":
+                            v.version = text
+                        del buf[:end + 1]
+                    elif tok == "$scope":
+                        if "$end" not in buf:
+                            break
+                        end = buf.index("$end")
+                        # $scope <type> <name> $end
+                        name = buf[2] if end >= 3 else buf[end - 1]
+                        scope_stack.append(name)
+                        sp = ".".join(scope_stack)
+                        if sp not in v.scopes:
+                            v.scopes.append(sp)
+                        del buf[:end + 1]
+                    elif tok == "$upscope":
+                        if "$end" not in buf:
+                            break
+                        end = buf.index("$end")
+                        if scope_stack:
+                            scope_stack.pop()
+                        del buf[:end + 1]
+                    elif tok == "$var":
+                        if "$end" not in buf:
+                            break
+                        end = buf.index("$end")
+                        parts = buf[1:end]
+                        # <type> <width> <id> <name> [<bitrange>]
+                        vtype, width, idc, name = parts[0], int(parts[1]), parts[2], parts[3]
+                        leaf = name
+                        full = ".".join(scope_stack + [leaf])
+                        if full not in v.meta:
+                            v.paths.append(full)
+                            v.meta[full] = {"type": vtype, "width": width}
+                            v.path_to_id[full] = idc
+                        v.changes.setdefault(idc, [])
+                        del buf[:end + 1]
+                    elif tok == "$enddefinitions":
+                        if "$end" not in buf:
+                            break
+                        end = buf.index("$end")
+                        del buf[:end + 1]
+                        in_defs = False
+                        buf = []
+                        break
+                    else:
+                        buf.pop(0)
+                continue
+
+            # ---------- value-change section ----------
+            if s[0] == "#":
+                cur_tick = int(s[1:])
+                if v.first_tick is None:
+                    v.first_tick = cur_tick
+                v.last_tick = max(v.last_tick, cur_tick)
+                continue
+            if s[0] in "$":
+                continue  # $dumpvars / $dumpoff / $end / $comment markers
+            if s[0] in "bB":
+                try:
+                    val, idc = s[1:].split()
+                except ValueError:
+                    continue
+                val = val.lower()
+            elif s[0] in "rR":
+                try:
+                    val, idc = s[1:].split()
+                except ValueError:
+                    continue
+            else:
+                val, idc = s[0], s[1:]
+            lst = v.changes.get(idc)
+            if lst is None:
+                continue
+            if id_last.get(idc) == val:
+                continue
+            id_last[idc] = val
+            lst.append((cur_tick, val))
+            if v.first_tick is None:
+                v.first_tick = cur_tick
+            v.last_tick = max(v.last_tick, cur_tick)
+
+    return v
+
+
+# ---- signal resolution (mirrors fsdb_query / shm_query ladder) -----------
+
+def normalize(pattern):
+    p = pattern.strip()
+    if p.startswith("/"):
+        p = p[1:]
+    return p.replace("/", ".")
+
+
+def has_glob(s):
+    return any(c in s for c in "*?")
+
+
+def glob_to_regex(pat):
+    """Glob -> anchored regex. Brackets stay literal (blk_inst[0] matches the
+    literal name), matching shm_query / fsdb_query."""
+    out = ["^"]
+    for ch in pat:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        elif ch in ".^$+{}()|[]\\":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    out.append("$")
+    return re.compile("".join(out), re.I)
+
+
+def search_index(pattern, v, limit=None):
+    pat = normalize(pattern or "*")
+    paths = v.paths
+
+    # 1. exact full path
+    exact = [p for p in paths if p == pat]
+    if exact:
+        return exact
+
+    low = pat.lower()
+
+    # 2. glob (must match the whole path, like the other backends)
+    if has_glob(pat):
+        rx = glob_to_regex(pat)
+        hits = [p for p in paths if rx.match(p)]
+        return hits[:limit] if limit else hits
+
+    # 3. scoped search: "core clk"
+    parts = pat.split()
+    if len(parts) == 2:
+        scope_kw, sig_kw = parts[0].lower(), parts[1].lower()
+        hits = [p for p in paths
+                if scope_kw in p.lower() and sig_kw in p.rsplit(".", 1)[-1].lower()]
+        return hits[:limit] if limit else hits
+
+    # 4. bare substring
+    hits = [p for p in paths if low in p.lower()]
+    return hits[:limit] if limit else hits
+
+
+def resolve_one(pattern, v):
+    hits = search_index(pattern, v)
+    if not hits:
+        die("signal not found: %s" % pattern)
+    if len(hits) > 1:
+        leaf = normalize(pattern).rsplit(".", 1)[-1].lower()
+        exact = [h for h in hits if h.rsplit(".", 1)[-1].lower() == leaf]
+        if len(exact) == 1:
+            hits = exact
+        else:
+            shown = hits[:40]
+            sys.stderr.write("Multiple signals match '%s' (%d):\n" % (pattern, len(hits)))
+            for i, h in enumerate(shown, 1):
+                sys.stderr.write("  %d) %s\n" % (i, h))
+            if len(hits) > len(shown):
+                sys.stderr.write("  ... and %d more\n" % (len(hits) - len(shown)))
+            die("ambiguous - re-run with a full path")
+    sys.stderr.write("Resolved: %s\n" % hits[0])
+    return hits[0]
+
+
+def series_for(path, v):
+    """(tick, extended-binary-value) list for one signal, in file order."""
+    idc = v.path_to_id[path]
+    width = v.meta[path]["width"]
+    out = []
+    for tick, raw in v.changes.get(idc, []):
+        if all(c in "01xzXZ" for c in raw):
+            out.append((tick, _extend(raw, width)))
+        else:
+            out.append((tick, raw))          # real / string - passed through
+    return out
+
+
+# ---- commands (output byte-compatible with shm_query) --------------------
+
+def cmd_info(path, v):
+    size = os.path.getsize(path)
+    print("File:       %s" % path)
+    print("Format:     VCD (IEEE 1364)")
+    print("Size:       %.1f MB" % (size / 1e6))
+    print("Timescale:  %g ns" % v.timescale_ns)
+    print("Date:       %s" % (v.date or "(none)"))
+    print("Version:    %s" % (v.version or "(none)"))
+    print("Signals:    %d" % len(v.paths))
+    print("Scopes:     %d" % len(v.scopes))
+    print("Time range: %s ns - %s ns" % (format_time_ns(v.t0_ns), format_time_ns(v.t1_ns)))
+
+
+def cmd_scopes(v, keyword):
+    kw = keyword.lower()
+    hits = [s for s in v.scopes if kw in s.lower()] if keyword else list(v.scopes)
+    if not hits:
+        print("No scopes matching '%s'" % (keyword if keyword else "(all)"))
+        return
+    hits.sort(key=lambda x: (x.count("."), x))
+    print("Scopes matching '%s':" % (keyword if keyword else "(all)"))
+    for h in hits[:50]:
+        print("  %s" % h)
+    if len(hits) > 50:
+        print("  ... and %d more" % (len(hits) - 50))
+    print("\nTotal: %d scopes" % len(hits))
+
+
+def cmd_signals(v, pattern, maxn):
+    hits = search_index(pattern or "*", v)
+    if not hits:
+        die("no signal matches '%s'" % pattern)
+    for h in hits[:maxn]:
+        print("%s  %s" % (v.meta[h]["type"], h))     # type column, like fsdb_query
+    if len(hits) > maxn:
+        print("\n(showing first %d, use -n to increase)" % maxn)
+    print("\nTotal matches: %d" % len(hits))
+
+
+def cmd_value(path, v, pattern, time_ns):
+    sig = resolve_one(pattern, v)
+    t = float(time_ns)
+    target = v.ns_to_tick(t) + 1e-9
+    at = [x for x in series_for(sig, v) if x[0] <= target]
+    if not at:
+        s = series_for(sig, v)
+        if not s:
+            die("no recorded value for %s" % sig)
+        val = s[0][1]
+    else:
+        val = at[-1][1]
+    print("Signal: %s" % sig)
+    print("Time:   %s ns" % format_time_ns(t))
+    print("Value:  %s (0x%s)" % (val, bin_to_hex(val)))
+
+
+def cmd_changes(v, pattern, t0, t1, maxn):
+    sig = resolve_one(pattern, v)
+    a = v.t0_ns if t0 is None else float(t0)
+    b = v.t1_ns if t1 is None else float(t1)
+    lo, hi = v.ns_to_tick(a) - 1e-9, v.ns_to_tick(b) + 1e-9
+    print("Signal: %s" % sig)
+    print("%-20s  %-40s  %s" % ("Time", "Binary", "Hex"))
+    print("%-20s  %-40s  %s" % ("----", "------", "---"))
+    prev = None
+    n = 0
+    for tick, val in series_for(sig, v):
+        if tick < lo or tick > hi:
+            continue
+        if val == prev:
+            continue
+        prev = val
+        n += 1
+        if n > maxn:
+            print("\n(capped at %d, use -n to increase)" % maxn)
+            n -= 1
+            break
+        print("%-20s  %-40s  0x%s" % (format_time_ns(v.tick_to_ns(tick)), val, bin_to_hex(val)))
+    if n == 0:
+        print("(no value changes)")
+    else:
+        print("\nTotal: %d value changes" % n)
+
+
+def _shallowest_scope(v, keyword):
+    kw = keyword.lower()
+    scopes = [s for s in v.scopes if kw in s.lower()]
+    if not scopes:
+        return None
+    scopes.sort(key=lambda x: (x.count("."), len(x)))
+    return scopes[0]
+
+
+def cmd_freq(v, keyword):
+    scope = _shallowest_scope(v, keyword)
+    if scope is None:
+        sys.stderr.write("No block matching '%s' found in design hierarchy.\n" % keyword)
+        sys.exit(1)
+    prefix = scope + "."
+    direct = [p for p in v.paths
+              if p.startswith(prefix) and "." not in p[len(prefix):]]
+    clocks = [p for p in direct
+              if "clk" in p.rsplit(".", 1)[-1].lower()
+              or "clock" in p.rsplit(".", 1)[-1].lower()]
+    print("Block: %s" % scope)
+    if not clocks:
+        print("  No clock signals found at this scope level.")
+        return
+    for p in clocks:
+        leaf = p.rsplit(".", 1)[-1]
+        width = v.meta[p]["width"]
+        if width > 1:
+            print("  %-30s  [%d:0] (skipped, not 1-bit)" % (leaf, width - 1))
+            continue
+        rises = []
+        prev = None
+        for tick, val in series_for(p, v):
+            if prev is not None and prev != "1" and val == "1":
+                rises.append(v.tick_to_ns(tick))
+            prev = val
+            if len(rises) > FREQ_EDGES:
+                break
+        if len(rises) < 2:
+            print("  %-30s  (no toggling detected)" % leaf)
+            continue
+        periods = [j - i for i, j in zip(rises, rises[1:])]
+        per = sum(periods) / len(periods) if periods else 0.0
+        if per <= 0:
+            print("  %-30s  (no toggling detected)" % leaf)
+            continue
+        ghz = 1.0 / per
+        if ghz >= 1.0:
+            print("  %-30s  %.3f GHz  (period %.3f ns)" % (leaf, ghz, per))
+        else:
+            print("  %-30s  %.1f MHz  (period %.3f ns)" % (leaf, ghz * 1e3, per))
+
+
+def cmd_debug(v, keyword, time_ns, window_ns):
+    kw = keyword.lower()
+    cand = [p for p in v.paths if kw in p.lower()]
+    if not cand:
+        die("no signals under '%s'" % keyword)
+    interesting = [c for c in cand if is_debug_signal_name(c.rsplit(".", 1)[-1].lower())]
+    if interesting:
+        cand = interesting
+    cand.sort(key=lambda x: (x.count("."), x))
+    sigs = cand[:DEBUG_SIGNAL_CAP]
+    if len(cand) > DEBUG_SIGNAL_CAP:
+        sys.stderr.write("Note: %d matching signals under '%s', showing the %d shallowest\n"
+                         % (len(cand), keyword, DEBUG_SIGNAL_CAP))
+
+    t = float(time_ns)
+    w = float(window_ns)
+    lo, hi = v.ns_to_tick(t - w) - 1e-9, v.ns_to_tick(t + w) + 1e-9
+    tgt = v.ns_to_tick(t) + 1e-9
+
+    print("=== %s @ %s ns (window +/-%s ns, %d signals) ===" %
+          (keyword, format_time_ns(t), format_time_ns(w), len(sigs)))
+
+    series = {p: series_for(p, v) for p in sigs}
+    for p in sigs:
+        at = [x for x in series[p] if x[0] <= tgt]
+        val = at[-1][1] if at else (series[p][0][1] if series[p] else "?")
+        print("  %-70s %-40s 0x%s" % (p, val, bin_to_hex(val)))
+
+    print("--- transitions in window ---")
+    events = {}
+    for p in sigs:
+        for tick, val in series[p]:
+            if lo <= tick <= hi:
+                events.setdefault(tick, []).append(p)
+    shown = 0
+    for tick in sorted(events):
+        names = events[tick]
+        print("  %-20s %s" % (format_time_ns(v.tick_to_ns(tick)), ", ".join(names[:6])))
+        shown += 1
+        if shown >= 40:
+            print("  ... more transitions suppressed")
+            break
+    if shown == 0:
+        print("  (none)")
+
+
+def cmd_batch(path, v, stream):
+    for raw in stream:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        print(">>> %s" % line)
+        try:
+            dispatch(path, v, line.split())
+        except SystemExit:
+            pass
+        print("")
+
+
+# ---- CLI (mirrors shm_query) -------------------------------------------
+
+def take_flag(args, flag, default, cast=float):
+    if flag in args:
+        i = args.index(flag)
+        try:
+            val = cast(args[i + 1])
+        except (IndexError, ValueError):
+            die("%s needs a value" % flag, 2)
+        del args[i:i + 2]
+        return val
+    return default
+
+
+def dispatch(path, v, argv):
+    cmd, rest = argv[0], list(argv[1:])
+    if cmd == "info":
+        return cmd_info(path, v)
+    if cmd == "scopes":
+        return cmd_scopes(v, rest[0] if rest else "")
+    if cmd == "signals":
+        maxn = int(take_flag(rest, "-n", SIGNALS_DEFAULT_MAX, int))
+        return cmd_signals(v, rest[0] if rest else "*", maxn)
+    if cmd == "value":
+        if len(rest) < 2:
+            die("usage: value <signal> <time_ns>", 2)
+        return cmd_value(path, v, rest[0], rest[1])
+    if cmd == "changes":
+        maxn = int(take_flag(rest, "-n", CHANGES_DEFAULT_CAP, int))
+        if not rest:
+            die("usage: changes <signal> [t0] [t1]", 2)
+        t0 = rest[1] if len(rest) > 1 else None
+        t1 = rest[2] if len(rest) > 2 else None
+        return cmd_changes(v, rest[0], t0, t1, maxn)
+    if cmd == "freq":
+        if not rest:
+            die("usage: freq <block>", 2)
+        return cmd_freq(v, rest[0])
+    if cmd == "debug":
+        w = take_flag(rest, "-w", 10.0)
+        if len(rest) < 2:
+            die("usage: debug <block> <time_ns> [-w window_ns]", 2)
+        return cmd_debug(v, rest[0], rest[1], w)
+    if cmd == "batch":
+        stream = open(rest[0]) if rest else sys.stdin
+        return cmd_batch(path, v, stream)
+    die("unknown command: %s" % cmd, 2)
+
+
+USAGE = """usage: vcd_query <file.vcd[.gz]> <command> [args]
+
+  info
+  scopes <keyword>
+  signals [pattern] [-n max]
+  value <signal> <time_ns>
+  changes <signal> [t0_ns] [t1_ns] [-n max]
+  freq <block>
+  debug <block> <time_ns> [-w window_ns]
+  batch [file]
+
+All times are in nanoseconds. Signals may be given as a full dot- or
+slash-separated path, a bare name, 'scope signal' (two words), or a glob.
+"""
+
+
+def resolve_file(p):
+    p = os.path.realpath(os.path.expanduser(p))
+    if not os.path.isfile(p):
+        die("no such VCD file: %s" % p)
+    return p
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "-V"):
+        sys.stdout.write("vcd_query 1.0\n")
+        sys.exit(0)
+    if len(argv) < 2 or argv[0] in ("-h", "--help"):
+        sys.stderr.write(USAGE)
+        sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
+    if "--refresh" in argv:
+        argv.remove("--refresh")          # accepted for surface parity; no cache yet
+    if len(argv) < 2:
+        sys.stderr.write(USAGE)
+        sys.exit(2)
+    path = resolve_file(argv[0])
+    v = parse_vcd(path)
+    if not v.paths:
+        die("no $var declarations found - is this a VCD file?")
+    dispatch(path, v, argv[1:])
+
+
+if __name__ == "__main__":
+    main()

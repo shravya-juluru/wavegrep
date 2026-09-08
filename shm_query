@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Shravya Juluru
+"""
+shm_query - query Cadence SimVision SST2 waveform databases (.shm).
+
+Companion to fsdb_query, with the same command surface, the same
+"all times are in nanoseconds" contract, and the same `Resolved: <path>`
+stderr convention so either backend can sit behind wfm_query.
+
+SST2 databases are a directory of <name>_hw_<N>.dsn (hierarchy) and
+<name>_hw_<N>.trn (transitions). Hierarchy comes from `sst2report -dsn`
+(cached); values come from targeted `simvisdbutil -CSV` extractions.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# ---- Toolchain: pinned, overridable, and never dependent on the user's env ----
+# Called by absolute path, never via PATH, so behaviour does not depend on the
+# user's environment. 2409 is the tested default; 2209 works identically.
+# Either way the Cadence binaries will not load without their own lib dirs on
+# LD_LIBRARY_PATH, which is why ENV below sets it explicitly.
+XCELIUM = os.environ.get("WFM_XCELIUM_ROOT", "/tools/Cadence/XCELIUM2409/tools.lnx86")
+SST2REPORT = os.path.join(XCELIUM, "bin", "sst2report")
+SIMVISDBUTIL = os.path.join(XCELIUM, "bin", "simvisdbutil")
+
+_LD = ":".join(p for p in [
+    os.path.join(XCELIUM, "lib", "64bit"),
+    os.path.join(XCELIUM, "lib"),
+    os.environ.get("LD_LIBRARY_PATH", ""),
+] if p)
+ENV = {**os.environ, "LD_LIBRARY_PATH": _LD}
+
+
+SCRATCH_ROOT = os.environ.get("WFM_SCRATCH_ROOT", "/scratch/wavegrep")
+
+
+def _default_cache_root():
+    """Per-user cache root. This tool is shared across the team, so it must never
+    default into one engineer's scratch directory."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "shared"
+    for cand in (os.path.join(SCRATCH_ROOT, user, "wfm_cache"),
+                 os.path.join(os.environ.get("TMPDIR", "/tmp"), "wfm_cache-%s" % user),
+                 os.path.expanduser("~/.cache/wavegrep")):
+        parent = os.path.dirname(cand)
+        if os.path.isdir(parent) and os.access(parent, os.W_OK):
+            return cand
+    return os.path.join("/tmp", "wfm_cache-%s" % user)
+
+
+CACHE_ROOT = os.environ.get("WFM_CACHE_DIR") or _default_cache_root()
+
+SIGNALS_DEFAULT_MAX = int(os.environ.get("WFM_SIGNALS_MAX", "50"))
+CHANGES_DEFAULT_CAP = int(os.environ.get("WFM_CHANGES_MAX", "1000"))
+DEBUG_SIGNAL_CAP = int(os.environ.get("WFM_DEBUG_CAP", "40"))
+FREQ_WINDOW_NS = float(os.environ.get("WFM_FREQ_WINDOW_NS", "100.0"))
+VALUE_EPS_NS = float(os.environ.get("WFM_VALUE_EPS_NS", "1.0"))
+
+# Signal-name keywords that mark a signal as "interesting" for `debug` output
+# (handshake/control signals worth surfacing without the user naming them).
+# Override to match a different naming convention, e.g.:
+#   WFM_DEBUG_KEYWORDS="clk,valid,ready,sem,irq"
+_DEBUG_KEYWORDS = tuple(
+    (os.environ.get("WFM_DEBUG_KEYWORDS") or
+     "clk,valid,ready,rdy,enable,_en,data,err,req,ack,grant,done,busy,stall").split(",")
+)
+
+# Cadence writes "Translation 12% done." spam with \r separators.
+_PROGRESS = re.compile(r"Translation\s+\d+%\s+done\.")
+_DBRANGE = re.compile(r"Database Range:\s*([0-9.eE+-]+)\s*-\s*([0-9.eE+-]+)\s*([a-z]*)")
+
+_UNIT_TO_NS = {"fs": 1e-6, "ps": 1e-3, "ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+
+
+def die(msg, code=1):
+    sys.stderr.write("shm_query: %s\n" % msg)
+    sys.exit(code)
+
+
+# ---- Formatting: byte-identical to fsdb_query so output does not depend on
+# ---- which backend ran. See format_time_ns()/bin_to_hex() in fsdb_query.cpp.
+
+def format_time_ns(ns):
+    """Decimal nanoseconds: 3 places at or above 1 ns, 6 places below."""
+    ns = float(ns)
+    return "%.3f" % ns if abs(ns) >= 1.0 else "%.6f" % ns
+
+
+def bin_to_hex(bits):
+    """Nibble-wise binary -> hex, propagating x/z exactly as fsdb_query does."""
+    if not bits or not all(c in "01xXzZ" for c in bits):
+        return bits
+    padded = bits.lower()
+    if len(padded) % 4:
+        padded = "0" * (4 - len(padded) % 4) + padded
+    out = []
+    for i in range(0, len(padded), 4):
+        nib = padded[i:i + 4]
+        if "x" in nib:
+            out.append("x")
+        elif "z" in nib:
+            out.append("z")
+        else:
+            out.append("%x" % int(nib, 2))
+    return "".join(out)
+
+
+def is_debug_signal_name(name_lower):
+    """Mirror of is_debug_signal_name() in fsdb_query.cpp. Keyword list is
+    shared via WFM_DEBUG_KEYWORDS so both backends can be retuned together."""
+    for kw in _DEBUG_KEYWORDS:
+        if kw and kw in name_lower:
+            return True
+    return name_lower.startswith("en")
+
+
+def check_toolchain():
+    """Fail with something readable instead of a bare loader error."""
+    for tool in (SST2REPORT, SIMVISDBUTIL):
+        if not os.path.isfile(tool):
+            die("required Cadence tool not found: %s\n"
+                "  Set WFM_XCELIUM_ROOT to an Xcelium install that provides it\n"
+                "  (needs sst2report + simvisdbutil; XCELIUM2209 and 2409 both provide them)."
+                % tool)
+        if not os.access(tool, os.X_OK):
+            die("Cadence tool is not executable: %s" % tool)
+
+
+# ---------------------------------------------------------------- db resolution
+
+def resolve_db(path):
+    """Accept a .shm directory (as a user would type it) or a .trn file."""
+    path = os.path.realpath(os.path.expanduser(path))
+    if not os.path.exists(path):
+        die("no such waveform database: %s" % path)
+
+    if os.path.isfile(path):
+        if path.endswith(".trn"):
+            return path
+        die("expected a .shm directory or a .trn file, got: %s" % path)
+
+    trns = sorted(glob.glob(os.path.join(path, "*.trn")))
+    if len(trns) == 1:
+        return trns[0]
+    if len(trns) > 1:
+        sys.stderr.write("Multiple .trn databases in %s:\n" % path)
+        for i, t in enumerate(trns, 1):
+            sys.stderr.write("  %d) %s\n" % (i, t))
+        die("ambiguous database - re-run with the specific .trn path")
+
+    # No .trn: most likely a VWDB-generation database, which needs a different
+    # toolchain (vwdbReport/vwdbExtract) that does not read SST2 and vice versa.
+    contents = sorted(os.listdir(path))[:10]
+    die("no .trn file in %s (contents: %s)\n"
+        "  This does not look like an SST2 database. VWDB-generation databases\n"
+        "  are not supported by shm_query - they need vwdbReport/vwdbExtract."
+        % (path, ", ".join(contents) if contents else "empty"))
+
+
+def cache_dir_for(trn):
+    st = os.stat(trn)
+    key = "%s|%d|%d" % (trn, st.st_mtime_ns, st.st_size)
+    h = hashlib.sha1(key.encode()).hexdigest()[:16]
+    base = os.path.basename(trn).replace(".trn", "")
+    return os.path.join(CACHE_ROOT, "%s_%s" % (base, h))
+
+
+# --------------------------------------------------------------- index building
+
+def _run(cmd, cwd=None, stdout=None):
+    try:
+        return subprocess.run(cmd, env=ENV, cwd=cwd, stdout=stdout,
+                              stderr=subprocess.PIPE, text=True)
+    except OSError as e:
+        die("failed to run %s: %s" % (cmd[0], e))
+
+
+def build_index(trn, cdir):
+    """sst2report -dsn gives every design signal path, one per line."""
+    os.makedirs(cdir, exist_ok=True)
+    sig_path = os.path.join(cdir, "signals.txt")
+    tmp = sig_path + ".partial"
+
+    with open(tmp, "w") as fh:
+        r = _run([SST2REPORT, "-dsn", trn], cwd=cdir, stdout=fh)
+    if r.returncode != 0:
+        os.unlink(tmp)
+        die("sst2report -dsn failed:\n%s" % (r.stderr or "").strip())
+    os.replace(tmp, sig_path)
+
+    # Derive every unique ancestor scope from the signal paths.
+    scopes = set()
+    nsig = 0
+    with open(sig_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            nsig += 1
+            idx = line.find(".")
+            while idx != -1:
+                scopes.add(line[:idx])
+                idx = line.find(".", idx + 1)
+
+    scope_path = os.path.join(cdir, "scopes.txt")
+    tmp = scope_path + ".partial"
+    with open(tmp, "w") as fh:
+        for s in sorted(scopes, key=lambda x: (x.count("."), x)):
+            fh.write(s + "\n")
+    os.replace(tmp, scope_path)
+
+    meta = {"trn": trn, "signals": nsig, "scopes": len(scopes)}
+    meta.update(probe_db_range(trn, cdir, sig_path))
+    with open(os.path.join(cdir, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+    return meta
+
+
+def probe_db_range(trn, cdir, sig_path):
+    """simvisdbutil prints 'Database Range: <a> - <b>ns' whenever -RANGE is used."""
+    first = None
+    with open(sig_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if line and "." in line:
+                first = line
+                break
+    if not first:
+        return {"t0_ns": 0.0, "t1_ns": 0.0}
+
+    out = os.path.join(cdir, "_probe.csv")
+    r = _run([SIMVISDBUTIL, trn, "-CSV", "-TIMEUNITS", "ns", "-SIGNAL", first,
+              "-RANGE", "0ns:1ns", "-OUTPUT", out, "-OVERWRITE",
+              "-NOCOPYRIGHT", "-NOLOG", "-MISSING"],
+             cwd=cdir, stdout=subprocess.PIPE)
+    blob = (r.stdout or "") + (r.stderr or "")
+    if os.path.exists(out):
+        os.unlink(out)
+    m = _DBRANGE.search(blob)
+    if not m:
+        return {"t0_ns": 0.0, "t1_ns": 0.0}
+    scale = _UNIT_TO_NS.get(m.group(3) or "ns", 1.0)
+    return {"t0_ns": float(m.group(1)) * scale, "t1_ns": float(m.group(2)) * scale}
+
+
+def evict_superseded(cdir, trn):
+    """Drop indexes built from an earlier version of this same database.
+
+    The cache key includes the .trn mtime and size, so a regenerated waveform
+    always lands in a fresh directory and can never be served stale data. That
+    correctness comes at the cost of orphaning the previous index, so clear it
+    out here - matched strictly on the recorded .trn path, so a rebuild never
+    touches an index belonging to a different database.
+    """
+    root = os.path.dirname(cdir)
+    keep = os.path.basename(cdir)
+    if not os.path.isdir(root):
+        return
+    for name in os.listdir(root):
+        if name == keep:
+            continue
+        old = os.path.join(root, name)
+        meta_p = os.path.join(old, "meta.json")
+        if not os.path.isfile(meta_p):
+            continue
+        try:
+            with open(meta_p) as fh:
+                if json.load(fh).get("trn") != trn:
+                    continue
+        except (OSError, ValueError):
+            continue
+        shutil.rmtree(old, ignore_errors=True)
+        sys.stderr.write("Waveform was regenerated - evicted stale index %s\n" % old)
+
+
+def load_index(trn, force=False):
+    cdir = cache_dir_for(trn)
+    meta_p = os.path.join(cdir, "meta.json")
+    if not force and os.path.exists(meta_p) \
+            and os.path.exists(os.path.join(cdir, "signals.txt")):
+        try:
+            with open(meta_p) as fh:
+                return cdir, json.load(fh)
+        except (OSError, ValueError):
+            pass
+    if force:
+        shutil.rmtree(cdir, ignore_errors=True)
+        sys.stderr.write("Rebuilding hierarchy index (--refresh)...\n")
+    else:
+        sys.stderr.write("Building hierarchy index (first query on this database)...\n")
+    meta = build_index(trn, cdir)
+    evict_superseded(cdir, trn)
+    sys.stderr.write("Indexed %d signals, %d scopes -> %s\n"
+                     % (meta["signals"], meta["scopes"], cdir))
+    return cdir, meta
+
+
+# ------------------------------------------------------------ signal resolution
+
+def normalize(pattern):
+    """fsdb_query accepts /-separated paths; SST2 hierarchy is dot-separated."""
+    p = pattern.strip()
+    if p.startswith("/"):
+        p = p[1:]
+    return p.replace("/", ".")
+
+
+def has_glob(s):
+    return any(c in s for c in "*?")
+
+
+def glob_to_ere(pat):
+    """Glob -> POSIX ERE for grep -E.
+
+    Deliberately not fnmatch.translate(): that emits Python-only syntax
+    ((?s:...), named groups) which grep -E cannot parse and which silently
+    matches nothing. Bracket indices like blk_inst[0] stay literal, matching
+    the documented behaviour.
+    """
+    out = ["^"]
+    for ch in pat:
+        if ch == "*":
+            out.append(".*")
+        elif ch == "?":
+            out.append(".")
+        elif ch in ".^$+{}()|[]\\":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    out.append("$")
+    return "".join(out)
+
+
+def _grep(args, path):
+    r = subprocess.run(["grep"] + args + [path], stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, text=True)
+    return [ln for ln in (r.stdout or "").splitlines() if ln]
+
+
+def search_index(pattern, path, limit=None):
+    """Mirror fsdb_query's matching ladder, using grep for speed."""
+    pat = normalize(pattern)
+
+    # 1. exact full path
+    hits = _grep(["-Fx", "--", pat], path)
+    if hits:
+        return hits
+
+    # 2. glob pattern
+    if has_glob(pat):
+        rx = glob_to_ere(pat)
+        hits = _grep(["-iE", "--", rx], path)
+        if hits:
+            return hits[:limit] if limit else hits
+        return []
+
+    # 3. scoped search: "core clk" -> narrow to scope, then match within it
+    parts = pat.split()
+    if len(parts) == 2:
+        scope_kw, sig_kw = parts
+        cand = _grep(["-iF", "--", scope_kw], path)
+        hits = [c for c in cand if sig_kw.lower() in c.rsplit(".", 1)[-1].lower()]
+        if hits:
+            return hits[:limit] if limit else hits
+        return []
+
+    # 4. bare substring
+    hits = _grep(["-iF", "--", pat], path)
+    return hits[:limit] if limit else hits
+
+
+def resolve_one(pattern, cdir):
+    """Resolve to exactly one signal or exit, matching fsdb_query semantics."""
+    sig_path = os.path.join(cdir, "signals.txt")
+    hits = search_index(pattern, sig_path)
+    if not hits:
+        die("signal not found: %s" % pattern)
+    if len(hits) > 1:
+        # Prefer a unique exact leaf-name match before giving up.
+        leaf = normalize(pattern).rsplit(".", 1)[-1].lower()
+        exact = [h for h in hits if h.rsplit(".", 1)[-1].lower() == leaf]
+        if len(exact) == 1:
+            hits = exact
+        else:
+            shown = hits[:40]
+            sys.stderr.write("Multiple signals match '%s' (%d):\n" % (pattern, len(hits)))
+            for i, h in enumerate(shown, 1):
+                sys.stderr.write("  %d) %s\n" % (i, h))
+            if len(hits) > len(shown):
+                sys.stderr.write("  ... and %d more\n" % (len(hits) - len(shown)))
+            die("ambiguous - re-run with a full path")
+    sys.stderr.write("Resolved: %s\n" % hits[0])
+    return hits[0]
+
+
+# ----------------------------------------------------------------- extraction
+
+def clamp(t, meta):
+    return max(meta.get("t0_ns", 0.0), min(float(t), meta.get("t1_ns", float(t))))
+
+
+def extract(trn, signals, t0, t1, cdir, meta, tag="q"):
+    """One simvisdbutil invocation for N signals - extra signals are ~free."""
+    # PID-scoped so concurrent queries on the same database never clobber
+    # each other's extraction.
+    out = os.path.join(cdir, "_%s.%d.csv" % (tag, os.getpid()))
+    # -RADIX binary + -SHOWX so values match fsdb_query's representation
+    # (binary with x/z preserved); hex is derived from it via bin_to_hex().
+    cmd = [SIMVISDBUTIL, trn, "-CSV", "-TIMEUNITS", "ns", "-RADIX", "binary",
+           "-SHOWX", "-OUTPUT", out, "-OVERWRITE", "-NOCOPYRIGHT", "-NOLOG",
+           "-MISSING"]
+    for s in signals:
+        cmd += ["-SIGNAL", s]
+    if t0 is not None and t1 is not None:
+        a, b = clamp(t0, meta), clamp(t1, meta)
+        if b <= a:
+            b = min(a + VALUE_EPS_NS, meta.get("t1_ns", a + VALUE_EPS_NS))
+        # Fixed-point, never %g: scientific notation (1.23457e+06ns) is both
+        # unparseable by simvisdbutil and lossy past 6 significant digits,
+        # which a >1 ms dump hits immediately.
+        cmd += ["-RANGE", "%.6fns:%.6fns" % (a, b)]
+
+    r = _run(cmd, cwd=cdir, stdout=subprocess.PIPE)
+    blob = _PROGRESS.sub("", (r.stdout or "") + (r.stderr or "")).replace("\r", "\n")
+    if not os.path.exists(out):
+        msg = "\n".join(ln for ln in blob.splitlines() if ln.strip())
+        die("simvisdbutil produced no output:\n%s" % msg)
+    return out
+
+
+def read_csv(path, discard=True):
+    with open(path) as fh:
+        rows = [ln.rstrip("\n") for ln in fh if ln.strip()]
+    if discard:
+        # Extraction output is consumed once; don't let it accumulate in the cache.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if not rows:
+        return [], []
+    header = rows[0].split(",")
+    data = []
+    for r in rows[1:]:
+        f = r.split(",")
+        try:
+            f[0] = float(f[0])
+        except ValueError:
+            continue
+        data.append(f)
+    return header, data
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_info(trn, cdir, meta):
+    dbdir = os.path.dirname(trn)
+    size = sum(os.path.getsize(os.path.join(dbdir, f))
+               for f in os.listdir(dbdir) if os.path.isfile(os.path.join(dbdir, f)))
+    print("Database:   %s" % trn)
+    print("Format:     SST2 (Cadence SimVision)")
+    print("Size:       %.1f MB (apparent)" % (size / 1e6))
+    print("Signals:    %d" % meta["signals"])
+    print("Scopes:     %d" % meta["scopes"])
+    print("Time range: %s ns - %s ns" % (format_time_ns(meta.get("t0_ns", 0)),
+                                         format_time_ns(meta.get("t1_ns", 0))))
+    print("Index:      %s" % cdir)
+
+
+def cmd_scopes(cdir, keyword):
+    path = os.path.join(cdir, "scopes.txt")
+    hits = _grep(["-iF", "--", keyword], path) if keyword else _grep(["-e", ""], path)
+    if not hits:
+        print("No scopes matching '%s'" % (keyword if keyword else "(all)"))
+        return
+    hits.sort(key=lambda x: (x.count("."), x))
+    print("Scopes matching '%s':" % (keyword if keyword else "(all)"))
+    for h in hits[:50]:
+        print("  %s" % h)
+    if len(hits) > 50:
+        print("  ... and %d more" % (len(hits) - 50))
+    print("\nTotal: %d scopes" % len(hits))
+
+
+def cmd_signals(cdir, pattern, maxn):
+    path = os.path.join(cdir, "signals.txt")
+    hits = search_index(pattern or "*", path)
+    if not hits:
+        die("no signal matches '%s'" % pattern)
+    for h in hits[:maxn]:
+        print(h)
+    if len(hits) > maxn:
+        print("\n(showing first %d, use -n to increase)" % maxn)
+    print("\nTotal matches: %d" % len(hits))
+
+
+def cmd_value(trn, cdir, meta, pattern, time_ns):
+    sig = resolve_one(pattern, cdir)
+    t = float(time_ns)
+    csv = extract(trn, [sig], t, t + VALUE_EPS_NS, cdir, meta, tag="value")
+    header, data = read_csv(csv)
+    if not data:
+        die("no recorded value for %s at %s ns" % (sig, format_time_ns(t)))
+    at = [r for r in data if r[0] <= t + 1e-9]
+    row = at[-1] if at else data[0]
+    val = row[1] if len(row) > 1 else ""
+    print("Signal: %s" % sig)
+    print("Time:   %s ns" % format_time_ns(t))
+    print("Value:  %s (0x%s)" % (val, bin_to_hex(val)))
+
+
+def cmd_changes(trn, cdir, meta, pattern, t0, t1, maxn):
+    sig = resolve_one(pattern, cdir)
+    a = meta.get("t0_ns", 0.0) if t0 is None else float(t0)
+    b = meta.get("t1_ns", 0.0) if t1 is None else float(t1)
+    csv = extract(trn, [sig], a, b, cdir, meta, tag="changes")
+    header, data = read_csv(csv)
+    print("Signal: %s" % sig)
+    print("%-20s  %-40s  %s" % ("Time", "Binary", "Hex"))
+    print("%-20s  %-40s  %s" % ("----", "------", "---"))
+    prev = None
+    n = 0
+    for r in data:
+        v = r[1] if len(r) > 1 else ""
+        if v == prev:
+            continue
+        prev = v
+        n += 1
+        if n > maxn:
+            print("\n(capped at %d, use -n to increase)" % maxn)
+            n -= 1
+            break
+        print("%-20s  %-40s  0x%s" % (format_time_ns(r[0]), v, bin_to_hex(v)))
+    if n == 0:
+        print("(no value changes)")
+    else:
+        print("\nTotal: %d value changes" % n)
+
+
+def cmd_freq(trn, cdir, meta, keyword):
+    """Measure every clock at the shallowest scope matching `keyword`.
+
+    Mirrors fsdb_query: report all clocks at the block level rather than
+    forcing the caller to disambiguate one.
+    """
+    scope_path = os.path.join(cdir, "scopes.txt")
+    scopes = _grep(["-iF", "--", keyword], scope_path)
+    if not scopes:
+        sys.stderr.write("No block matching '%s' found in design hierarchy.\n" % keyword)
+        sys.exit(1)
+    scopes.sort(key=lambda x: (x.count("."), len(x)))
+    scope = scopes[0]
+
+    sig_path = os.path.join(cdir, "signals.txt")
+    prefix = scope + "."
+    direct = [s for s in _grep(["-F", "--", prefix], sig_path)
+              if s.startswith(prefix) and "." not in s[len(prefix):]]
+    clocks = [s for s in direct if "clk" in s.rsplit(".", 1)[-1].lower()
+              or "clock" in s.rsplit(".", 1)[-1].lower()]
+
+    print("Block: %s" % scope)
+    if not clocks:
+        print("  No clock signals found at this scope level.")
+        return
+
+    a = meta.get("t0_ns", 0.0)
+    b = min(a + FREQ_WINDOW_NS, meta.get("t1_ns", a + FREQ_WINDOW_NS))
+    # All clocks in one extraction - extra signals are nearly free.
+    csv = extract(trn, clocks, a, b, cdir, meta, tag="freq")
+    header, data = read_csv(csv)
+    if not data:
+        print("  (no data in %s..%s ns)" % (format_time_ns(a), format_time_ns(b)))
+        return
+
+    for col, name in enumerate(header[1:], 1):
+        leaf = name.rsplit(".", 1)[-1]
+        series = [(r[0], r[col]) for r in data if col < len(r)]
+        width = max((len(v) for _, v in series if v), default=1)
+        if width > 1:
+            print("  %-30s  [%d:0] (skipped, not 1-bit)" % (leaf, width - 1))
+            continue
+        edges = []
+        prev = None
+        for t, v in series:
+            if prev is not None and v != prev:
+                edges.append(t)
+            prev = v
+        if len(edges) < 3:
+            print("  %-30s  (no toggling detected)" % leaf)
+            continue
+        rises = edges[0::2]
+        periods = [j - i for i, j in zip(rises, rises[1:])]
+        per = sum(periods) / len(periods) if periods else 0.0
+        if per <= 0:
+            print("  %-30s  (no toggling detected)" % leaf)
+            continue
+        ghz = 1.0 / per
+        if ghz >= 1.0:
+            print("  %-30s  %.3f GHz  (period %.3f ns)" % (leaf, ghz, per))
+        else:
+            print("  %-30s  %.1f MHz  (period %.3f ns)" % (leaf, ghz * 1e3, per))
+
+
+def cmd_debug(trn, cdir, meta, keyword, time_ns, window_ns):
+    """One extraction covering every signal under a block - N signals cost ~1."""
+    path = os.path.join(cdir, "signals.txt")
+    cand = _grep(["-iF", "--", keyword], path)
+    if not cand:
+        die("no signals under '%s'" % keyword)
+    # Same "interesting signal" filter fsdb_query uses, so debug surfaces the
+    # same control/handshake signals regardless of backend.
+    interesting = [c for c in cand if is_debug_signal_name(c.rsplit(".", 1)[-1].lower())]
+    if interesting:
+        cand = interesting
+    cand.sort(key=lambda x: (x.count("."), x))
+    sigs = cand[:DEBUG_SIGNAL_CAP]
+    if len(cand) > DEBUG_SIGNAL_CAP:
+        sys.stderr.write("Note: %d matching signals under '%s', showing the %d shallowest\n"
+                         % (len(cand), keyword, DEBUG_SIGNAL_CAP))
+
+    t = float(time_ns)
+    w = float(window_ns)
+    csv = extract(trn, sigs, t - w, t + w, cdir, meta, tag="debug")
+    header, data = read_csv(csv)
+    if not data:
+        die("no data for '%s' in %s..%s ns"
+            % (keyword, format_time_ns(t - w), format_time_ns(t + w)))
+
+    print("=== %s @ %s ns (window +/-%s ns, %d signals) ===" %
+          (keyword, format_time_ns(t), format_time_ns(w), len(sigs)))
+    at = [r for r in data if r[0] <= t + 1e-9]
+    snap = at[-1] if at else data[0]
+    for i, name in enumerate(header[1:], 1):
+        val = snap[i] if i < len(snap) else "?"
+        print("  %-70s %-40s 0x%s" % (name, val, bin_to_hex(val)))
+
+    print("--- transitions in window ---")
+    prev = None
+    shown = 0
+    for r in data:
+        cur = tuple(r[1:])
+        if prev is not None and cur != prev:
+            changed = [header[i] for i in range(1, min(len(r), len(header)))
+                       if i - 1 < len(prev) and r[i] != prev[i - 1]]
+            if changed:
+                print("  %-20s %s" % (format_time_ns(r[0]), ", ".join(changed[:6])))
+                shown += 1
+                if shown >= 40:
+                    print("  ... more transitions suppressed")
+                    break
+        prev = cur
+    if shown == 0:
+        print("  (none)")
+
+
+def cmd_batch(trn, cdir, meta, stream):
+    for raw in stream:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        print(">>> %s" % line)
+        try:
+            dispatch(trn, cdir, meta, line.split())
+        except SystemExit:
+            pass
+        print("")
+
+
+# ----------------------------------------------------------------------- CLI
+
+def take_flag(args, flag, default, cast=float):
+    if flag in args:
+        i = args.index(flag)
+        try:
+            v = cast(args[i + 1])
+        except (IndexError, ValueError):
+            die("%s needs a value" % flag)
+        del args[i:i + 2]
+        return v
+    return default
+
+
+def dispatch(trn, cdir, meta, argv):
+    cmd, rest = argv[0], list(argv[1:])
+
+    if cmd == "info":
+        return cmd_info(trn, cdir, meta)
+    if cmd == "scopes":
+        return cmd_scopes(cdir, rest[0] if rest else "")
+    if cmd == "signals":
+        maxn = int(take_flag(rest, "-n", SIGNALS_DEFAULT_MAX, int))
+        return cmd_signals(cdir, rest[0] if rest else "*", maxn)
+    if cmd == "value":
+        if len(rest) < 2:
+            die("usage: value <signal> <time_ns>")
+        return cmd_value(trn, cdir, meta, rest[0], rest[1])
+    if cmd == "changes":
+        maxn = int(take_flag(rest, "-n", CHANGES_DEFAULT_CAP, int))
+        if not rest:
+            die("usage: changes <signal> [t0] [t1]")
+        t0 = rest[1] if len(rest) > 1 else None
+        t1 = rest[2] if len(rest) > 2 else None
+        return cmd_changes(trn, cdir, meta, rest[0], t0, t1, maxn)
+    if cmd == "freq":
+        if not rest:
+            die("usage: freq <block>")
+        return cmd_freq(trn, cdir, meta, rest[0])
+    if cmd == "debug":
+        w = take_flag(rest, "-w", 10.0)
+        if len(rest) < 2:
+            die("usage: debug <block> <time_ns> [-w window_ns]")
+        return cmd_debug(trn, cdir, meta, rest[0], rest[1], w)
+    if cmd == "batch":
+        stream = open(rest[0]) if rest else sys.stdin
+        return cmd_batch(trn, cdir, meta, stream)
+    die("unknown command: %s" % cmd)
+
+
+USAGE = """usage: shm_query <shm_dir_or_trn> <command> [args]
+
+  info
+  scopes <keyword>
+  signals [pattern] [-n max]
+  value <signal> <time_ns>
+  changes <signal> [t0_ns] [t1_ns] [-n max]
+  freq <block>
+  debug <block> <time_ns> [-w window_ns]
+  batch [file]
+
+  --refresh   rebuild the hierarchy index before querying
+
+All times are in nanoseconds. Signals may be given as a full dot- or
+slash-separated path, a bare name, 'scope signal' (two words), or a glob.
+
+The index is keyed on the .trn mtime and size, so a regenerated waveform is
+re-indexed automatically and the superseded index is deleted. Use --refresh
+only to force a rebuild when the file itself did not change.
+
+Env: WFM_XCELIUM_ROOT (default %s)
+     WFM_CACHE_DIR    (default %s)
+""" % (XCELIUM, CACHE_ROOT)
+
+
+def main():
+    argv = sys.argv[1:]
+    if len(argv) < 2 or argv[0] in ("-h", "--help"):
+        sys.stderr.write(USAGE)
+        sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
+    force = False
+    if "--refresh" in argv:
+        argv.remove("--refresh")
+        force = True
+    if len(argv) < 2:
+        sys.stderr.write(USAGE)
+        sys.exit(2)
+    check_toolchain()
+    trn = resolve_db(argv[0])
+    cdir, meta = load_index(trn, force=force)
+    dispatch(trn, cdir, meta, argv[1:])
+
+
+if __name__ == "__main__":
+    main()

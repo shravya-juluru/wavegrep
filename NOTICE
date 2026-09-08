@@ -1,0 +1,10 @@
+wavegrep
+Copyright 2026 Shravya Juluru
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes only original source and glue code. It does not include,
+bundle, or grant any license to Synopsys or Cadence software, headers, or
+libraries (e.g. the Verdi FsdbReader kit, sst2report, simvisdbutil). Those
+remain subject to their respective vendor licenses and must be obtained
+separately by the user.
